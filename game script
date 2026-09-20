@@ -1,0 +1,143 @@
+extends Node2D
+@onready var player: CharacterBody2D = $player
+@onready var playerhitbox: CollisionShape2D = $player/CollisionShape2D
+@onready var playeranim: AnimationPlayer = $player/AnimationPlayer
+@onready var root: Node2D = $".."
+@onready var fadescreen: AnimationPlayer = $CanvasLayer/Sprite2D/AnimationPlayer
+
+var currentlyin = "bedroom"
+var is_teleporting = false
+
+func _ready():
+	root.gamepaused = false
+	is_teleporting = false
+	update_room_visibility()
+	connect_teleporters()
+
+func connect_teleporters():
+	for room in get_children():
+		if room.name == "player":
+			continue
+		if room is Node2D:
+			for child in room.get_children():
+				if child is Area2D and child.name.begins_with("teleport"):
+					child.body_entered.connect(_on_teleporter_entered.bind(child))
+
+func _on_teleporter_entered(body: Node2D, teleporter: Area2D):
+	if body == player and not is_teleporting:
+		teleport_player(teleporter)
+
+func teleport_player(teleporter: Area2D):
+	is_teleporting = true
+	# Immediately pause and start fade
+	root.gamepaused = true
+	fadescreen.play("fadeinandout")
+	
+	var full_name = teleporter.name
+	var remaining = full_name.trim_prefix("teleport")
+	
+	var x_index = remaining.find("x")
+	var y_index = remaining.find("y")
+	
+	if x_index == -1 or y_index == -1:
+		push_error("Invalid teleporter name format: " + full_name)
+		root.gamepaused = false
+		is_teleporting = false
+		return
+	
+	var location = remaining.substr(0, x_index)
+	var x_str = remaining.substr(x_index + 1, y_index - x_index - 1)
+	var x_pos = int(x_str)
+	
+	var after_y = remaining.substr(y_index + 1)
+	
+	var direction_start = 0
+	var found = false
+	for i in range(after_y.length()):
+		var c = after_y[i]
+		if c != "0" and c != "1" and c != "2" and c != "3" and c != "4" and c != "5" and c != "6" and c != "7" and c != "8" and c != "9":
+			direction_start = i
+			found = true
+			break
+	
+	if not found:
+		push_error("Invalid teleporter name format: " + full_name)
+		root.gamepaused = false
+		is_teleporting = false
+		return
+	
+	var y_str = after_y.substr(0, direction_start)
+	var y_pos = int(y_str)
+	var direction = after_y.substr(direction_start)
+	
+	# Wait 0.55 seconds for fade to reach halfway point
+	await get_tree().create_timer(0.55).timeout
+	
+	# At 0.55s: teleport player and change room
+	player.global_position = Vector2(x_pos, y_pos)
+	playeranim.play(direction)
+	playeranim.pause()
+	playeranim.seek(0.001)
+	player.last_direction = direction
+	player.current_direction = ""
+	set_current_room(location)
+	
+	# Wait remaining 0.75 seconds (total 1.3s)
+	await get_tree().create_timer(0.75).timeout
+	root.gamepaused = false
+	is_teleporting = false
+
+func set_current_room(room_name: String):
+	currentlyin = room_name
+	update_room_visibility()
+
+func update_room_visibility():
+	for child in get_children():
+		if child.name == "player":
+			continue
+		
+		if child is Node2D:
+			if child.name == currentlyin:
+				child.visible = true
+				enable_collisions(child)
+			else:
+				child.visible = false
+				disable_collisions(child)
+
+func enable_collisions(node: Node):
+	for child in node.get_children():
+		if child is StaticBody2D:
+			child.collision_layer = 1
+			child.collision_mask = 1
+		elif child is Area2D:
+			child.collision_layer = 1
+			child.collision_mask = 1
+		elif child is CharacterBody2D:
+			child.collision_layer = 1
+			child.collision_mask = 1
+		elif child is RigidBody2D:
+			child.collision_layer = 1
+			child.collision_mask = 1
+		elif child is CollisionShape2D:
+			child.disabled = false
+		# Recursively enable collisions in all descendants
+		enable_collisions(child)
+
+func disable_collisions(node: Node):
+	for child in node.get_children():
+		if child is StaticBody2D:
+			child.collision_layer = 0
+			child.collision_mask = 0
+		elif child is Area2D:
+			child.collision_layer = 0
+			child.collision_mask = 0
+		elif child is CharacterBody2D:
+			child.collision_layer = 0
+			child.collision_mask = 0
+		elif child is RigidBody2D:
+			child.collision_layer = 0
+			child.collision_mask = 0
+		elif child is CollisionShape2D:
+			child.disabled = true
+		# Recursively disable collisions in all descendants
+		disable_collisions(child)
