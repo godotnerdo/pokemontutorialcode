@@ -1,0 +1,562 @@
+extends Node2D
+
+# Actions can be: "continue", "end", or "choice<nodename>x<x_pos>y<y_pos>"
+# Bracket actions in text: [hideall], [showall], [hide<nodename>], [show<nodename>], [fadein]
+# "continue"/"end" can also carry bracket actions of their own, e.g. "end[rename...]" -
+# those fire the moment selectkey is pressed to advance/end, at the same time as advancing.
+
+var dialogue_sequences = [
+	["[hidepokemonchoices][fadein]PROF. Birch is in trouble! Release a POKéMON and rescue him!", "choicehandx443y132", "choicehandx933y329","choicehandx1447y191"],
+]
+# ========== CHOICE DIALOGUE SEQUENCES ==========
+var choice_dialogues = {
+	"choicehandx443y132": [["[pokemonchoicesplaytreecko][showpokemonchoices]Would you like to choose TREECKO?", "end"]],
+	"choicehandx933y329": [["[pokemonchoicesplaytorchic][showpokemonchoices]Would you like to choose TORCHIC!", "end"]],
+	"choicehandx1447y191": [["[pokemonchoicesplaymudkip][showpokemonchoices]Would you like to choose MUDKIP!", "end[renameprofessorbackandforth_professorfollowplayer]"]],
+}
+# ====================================================
+
+var dialogueplaying = false
+var max_lines_per_page = 2
+var chars_per_line = 40
+var scroll_speed = 0.03
+var scroll_fastforward_speed = 0.01
+var current_sequence_index = 0
+var sequences = []
+var can_continue = false
+var is_scrolling = false
+
+@onready var textbox: Sprite2D = $Sprite2D
+@onready var dialoguetext: Label = $Label
+@onready var parent: CanvasLayer = $".."
+@onready var root: Node2D = $"../.."
+@onready var fadein_canvas: CanvasLayer = $"../../game/CanvasLayer"
+@onready var fadein: AnimationPlayer = $"../../game/CanvasLayer/Sprite2D/AnimationPlayer"
+@onready var game: Node2D = $"../../game"
+
+# Choice system variables
+var current_choice_node_name = ""
+var current_choice_positions = []
+var current_choice_index = 0
+var is_in_choice_mode = false
+var previous_sequence_index = 0  # Track where we came from for cancel functionality
+
+# Tracks the top-level dialogue (dialogue_sequences or whatever was passed to start_dialogue)
+# so cancelkey during a choice's response can restart it from the beginning
+var root_dialogue_sequences = []
+var in_choice_response = false
+var instant_text_mode = false  # true = text appears instantly, no character scroll
+
+# Actions attached to the current sequence's continue/end entry (e.g. "end[rename...]"),
+# fired the moment selectkey advances/ends the dialogue
+var current_sequence_actions = []
+
+func _ready():
+	dialoguetext.text = ""
+	visible = false
+	parent.visible = false  # Start invisible, will be shown after bracket actions
+	parent.set_meta("rootvisibilityimmune", true)
+	dialoguetext.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+
+func _process(_delta):
+	visible = dialogueplaying
+	
+	if is_in_choice_mode:
+		# Handle choice navigation
+		if Input.is_action_just_pressed("rightkey"):
+			current_choice_index = min(current_choice_index + 1, current_choice_positions.size() - 1)
+			move_choice_node_to_position()
+		elif Input.is_action_just_pressed("leftkey"):
+			current_choice_index = max(current_choice_index - 1, 0)
+			move_choice_node_to_position()
+		elif Input.is_action_just_pressed("selectkey"):
+			select_current_choice()
+		elif Input.is_action_just_pressed("cancelkey"):
+			cancel_choice()
+	elif dialogueplaying and can_continue and in_choice_response and Input.is_action_just_pressed("cancelkey"):
+		restart_root_dialogue()
+	elif dialogueplaying and can_continue and Input.is_action_just_pressed("selectkey"):
+		advance_after_actions()
+
+func start_dialogue(custom_sequences = null, is_choice_response: bool = false, instant: bool = false):
+	"""
+	Start dialogue. Leave empty to use dialogue_sequences at top.
+	Or pass custom array: start_dialogue([["text", "continue"], ["more", "end"]])
+	instant = true skips the character-by-character text scroll (text appears immediately)
+	"""
+	var dialogues_to_play = custom_sequences if custom_sequences else dialogue_sequences
+	
+	if not is_choice_response:
+		root_dialogue_sequences = dialogues_to_play
+	in_choice_response = is_choice_response
+	instant_text_mode = instant
+	
+	root.gamepaused = true
+	dialogueplaying = true
+	sequences = split_long_text(dialogues_to_play)
+	current_sequence_index = 0
+	can_continue = false
+	is_scrolling = false
+	is_in_choice_mode = false
+	dialoguetext.text = ""
+	
+	# Hide all choice nodes at the start
+	hide_all_choice_nodes()
+	
+	play_current_sequence()
+
+func hide_all_choice_nodes():
+	"""Hide all child nodes that start with 'choice'"""
+	for child in get_children():
+		if child.name.begins_with("choice"):
+			child.visible = false
+
+func split_long_text(dialogue_sequences: Array) -> Array:
+	"""Split text into pages based on max_lines_per_page.
+	Bracket actions like [fadein] don't count toward the character limit since
+	they're never displayed - only the visible text length matters here."""
+	var result = []
+	var max_chars_per_page = max_lines_per_page * chars_per_line
+	
+	for sequence in dialogue_sequences:
+		var text = sequence[0]
+		var actions = sequence.slice(1)  # Get all items after the text
+		
+		# Extract bracket tags separately so they don't count toward length,
+		# and so they only end up on the first page chunk (they already execute
+		# before any text scrolls, regardless of their position in the string)
+		var bracket_tags = extract_bracket_actions(text)
+		var visible_text = remove_bracket_actions(text)
+		
+		var bracket_prefix = ""
+		for tag in bracket_tags:
+			bracket_prefix += "[" + tag + "]"
+		
+		# If the VISIBLE text is longer than limit, split it into pages
+		if visible_text.length() > max_chars_per_page:
+			var remaining = visible_text
+			var is_first_chunk = true
+			while remaining.length() > 0:
+				var chunk = remaining.substr(0, max_chars_per_page)
+				remaining = remaining.substr(max_chars_per_page)
+				
+				var chunk_text = chunk
+				if is_first_chunk:
+					chunk_text = bracket_prefix + chunk_text
+					is_first_chunk = false
+				
+				# All chunks except the last use "continue" for page breaks
+				if remaining.length() > 0:
+					result.append([chunk_text, "continue"])
+				else:
+					# Last chunk uses the original actions
+					result.append([chunk_text] + actions)
+		else:
+			result.append(sequence)
+	
+	return result
+
+func play_current_sequence():
+	if current_sequence_index >= sequences.size():
+		end_dialogue()
+		return
+	
+	var sequence = sequences[current_sequence_index]
+	var text = sequence[0]  # The text to display
+	var actions = sequence.slice(1) if sequence.size() > 1 else []  # All remaining items (actions)
+	
+	# Remember this sequence's continue/end actions so selectkey can trigger
+	# any bracket actions embedded in them (e.g. "end[rename...]") when advancing
+	current_sequence_actions = actions
+	
+	# Extract and process bracket actions from the text
+	var bracket_actions = extract_bracket_actions(text)
+	text = remove_bracket_actions(text)
+	
+	# Execute bracket actions first, no delay
+	if bracket_actions.size() > 0:
+		await execute_actions(bracket_actions)
+	
+	# Make dialogues visible after bracket actions (before text scrolls)
+	parent.visible = true
+	
+	# Start scrolling the text
+	await scroll_text(text)
+	
+	# After scrolling, wait 0.5 seconds (skip if instant mode)
+	if not instant_text_mode:
+		await get_tree().create_timer(0.5).timeout
+	
+	# Check if this is a choice sequence
+	var has_choice = false
+	for action in actions:
+		if action.begins_with("choice"):
+			has_choice = true
+			break
+	
+	if has_choice:
+		# This is a choice sequence
+		setup_choice_system(actions)
+	else:
+		# Regular continue/end
+		can_continue = true
+
+func advance_after_actions() -> void:
+	"""
+	Called when selectkey advances/ends a "continue"/"end" sequence. Runs any
+	bracket actions embedded in that sequence's action strings (e.g. the
+	"[rename...]" part of "end[rename...]" or "continue[fadein]") first, then
+	advances to the next sequence (or ends the dialogue, same as before, based
+	on whether current_sequence_index still has entries left).
+	"""
+	can_continue = false  # block re-triggering while embedded actions run
+	
+	for action in current_sequence_actions:
+		if action.begins_with("choice"):
+			continue  # choice entries are handled by the choice system, not here
+		var embedded_actions = extract_bracket_actions(action)
+		if embedded_actions.size() > 0:
+			await execute_actions(embedded_actions)
+	
+	next_sequence()
+
+func extract_bracket_actions(text: String) -> Array:
+	"""Extract all [action] from text"""
+	var actions = []
+	var regex = RegEx.new()
+	regex.compile(r"\[([^\]]+)\]")
+	
+	var matches = regex.search_all(text)
+	for match in matches:
+		actions.append(match.get_string(1))
+	
+	return actions
+
+func remove_bracket_actions(text: String) -> String:
+	"""Remove all [action] from text"""
+	var regex = RegEx.new()
+	regex.compile(r"\[[^\]]+\]")
+	return regex.sub(text, "", true)
+
+func execute_actions(actions: Array) -> void:
+	"""Execute a list of actions with no delay between each"""
+	for i in range(actions.size()):
+		await execute_single_action(actions[i])
+
+func execute_single_action(action: String) -> void:
+	"""Execute a single bracket action"""
+	if action == "hideall":
+		visible = false
+	elif action == "showall":
+		visible = true
+	elif action == "fadein":
+		await execute_fadein_action()
+	elif action.begins_with("hide"):
+		var node_name = action.substr(4)  # Remove "hide" prefix
+		if has_node(node_name):
+			get_node(node_name).visible = false
+	elif action.begins_with("show"):
+		var node_name = action.substr(4)  # Remove "show" prefix
+		if has_node(node_name):
+			get_node(node_name).visible = true
+	elif action.begins_with("rename"):
+		# Handle [rename<oldname>_<newname>] format
+		var rename_data = parse_rename_action(action)
+		if rename_data:
+			execute_rename_action(rename_data["old_name"], rename_data["new_name"])
+	elif "play" in action:
+		# Handle [nodenameplaying animation] format
+		var play_data = parse_play_action(action)
+		if play_data:
+			play_node_animation(play_data["node_name"], play_data["animation_name"])
+
+func execute_fadein_action() -> void:
+	"""
+	[fadein]:
+	1. Current node fades out via modulate alpha (255 -> 0). We use alpha instead
+	   of the .visible property because _process() sets visible = dialogueplaying
+	   every frame, which would instantly override a manual visible = false.
+	2. Play the "fadeinandout" animation (1.3s total)
+	3. At the 0.8s mark: alpha instantly snaps back to full (0 -> 255) as part of
+	   modulate snapping to black, and child Label/Sprite2D are hidden
+	4. Modulate transitions smoothly from black to white over the remaining time,
+	   ending exactly when the animation reaches 1.3s total
+	5. Label/Sprite2D become visible again once the transition finishes
+	"""
+	# Step 1: Fade out via alpha (not .visible, which _process overrides every frame)
+	modulate.a = 0.0
+	
+	# Step 2: Make the fade canvas visible and play the fade animation
+	fadein_canvas.visible = true
+	fadein.play("fadeinandout")
+	
+	var total_length = fadein.current_animation_length
+	if total_length <= 0.0:
+		total_length = 1.3  # fallback if length can't be read
+	
+	var pre_wait = 0.8
+	if pre_wait > total_length:
+		pre_wait = total_length
+	
+	# Step 3: Wait until the 0.8s mark, then snap alpha back to full (black, opaque)
+	await get_tree().create_timer(pre_wait).timeout
+	
+	modulate = Color(0.0, 0.0, 0.0, 1.0)  # black, alpha instantly back to 255
+	
+	if has_node("Label"):
+		get_node("Label").visible = false
+	if has_node("Sprite2D"):
+		get_node("Sprite2D").visible = false
+	
+	# Step 4: Transition from black to white for whatever time remains until 1.3s total
+	var transition_time = total_length - pre_wait
+	if transition_time < 0.0:
+		transition_time = 0.0
+	
+	var tween = create_tween()
+	tween.set_trans(Tween.TRANS_LINEAR)
+	tween.set_ease(Tween.EASE_IN_OUT)
+	tween.tween_property(self, "modulate", Color.WHITE, transition_time)
+	await tween.finished
+	
+	# Step 5: Show children again now that the fade has finished
+	if has_node("Label"):
+		get_node("Label").visible = true
+	if has_node("Sprite2D"):
+		get_node("Sprite2D").visible = true
+
+func setup_choice_system(actions: Array) -> void:
+	"""Setup the choice system with the given choice actions"""
+	is_in_choice_mode = true
+	current_choice_positions = []
+	current_choice_index = 0
+	previous_sequence_index = current_sequence_index  # Save current position for cancel
+	
+	# Parse choice actions to extract node name and positions
+	for action in actions:
+		if action.begins_with("choice"):
+			var choice_data = parse_choice_action(action)
+			if choice_data:
+				current_choice_positions.append(choice_data)
+	
+	if current_choice_positions.size() > 0:
+		# Extract the node name from the first choice (e.g., "choicehand" from "choicehandx443y132")
+		current_choice_node_name = current_choice_positions[0]["node_name"]
+		# Show only the selected choice node, hide others
+		update_visible_choice_nodes()
+		# Play idle animation on the choice node
+		play_node_animation("choice" + current_choice_node_name, "idle")
+		# Move to the first position
+		move_choice_node_to_position()
+
+func parse_choice_action(action: String) -> Dictionary:
+	"""
+	Parse choice action like 'choicehandx443y132'
+	Returns dict with node_name, x, y, and full name
+	Pattern: choice<nodename>x<number>y<number>
+	"""
+	var regex = RegEx.new()
+	regex.compile(r"^choice([a-zA-Z0-9]+)x(-?\d+)y(-?\d+)$")
+	
+	var match = regex.search(action)
+	if match:
+		return {
+			"node_name": match.get_string(1),
+			"x": int(match.get_string(2)),
+			"y": int(match.get_string(3)),
+			"full_name": action  # Store full name for lookup
+		}
+	
+	return {}
+
+func update_visible_choice_nodes() -> void:
+	"""Show only the current choice node, hide all other choice nodes"""
+	for child in get_children():
+		if child.name.begins_with("choice"):
+			child.visible = (child.name == "choice" + current_choice_node_name)
+
+func move_choice_node_to_position() -> void:
+	"""Move the current choice node to the current position"""
+	if current_choice_positions.size() == 0:
+		return
+	
+	var current_pos = current_choice_positions[current_choice_index]
+	var node = get_node("choice" + current_choice_node_name)
+	
+	if node:
+		node.position = Vector2(current_pos["x"], current_pos["y"])
+
+func select_current_choice() -> void:
+	"""Handle selecting the current choice"""
+	if current_choice_positions.size() == 0:
+		return
+	
+	var choice_full_name = current_choice_positions[current_choice_index]["full_name"]
+	
+	# Look up the dialogue sequence for this choice
+	if choice_full_name in choice_dialogues:
+		var choice_sequence = choice_dialogues[choice_full_name]
+		is_in_choice_mode = false
+		start_dialogue(choice_sequence, true)
+	else:
+		push_warning("No dialogue sequence found for choice: " + choice_full_name)
+
+func cancel_choice() -> void:
+	"""Go back to the previous dialogue sequence when cancel is pressed"""
+	is_in_choice_mode = false
+	current_sequence_index = previous_sequence_index
+	can_continue = true
+
+func restart_root_dialogue() -> void:
+	"""Cancel out of a choice's response dialogue and restart the original top-level dialogue,
+	skipping any [fadein] action and showing all text instantly (no scroll)"""
+	var restart_sequences = strip_fadein_from_sequences(root_dialogue_sequences)
+	start_dialogue(restart_sequences, false, true)
+
+func strip_fadein_from_sequences(seqs: Array) -> Array:
+	"""Return a copy of the sequences with [fadein] removed from the text of each entry"""
+	var result = []
+	for sequence in seqs:
+		var new_sequence = sequence.duplicate()
+		new_sequence[0] = new_sequence[0].replace("[fadein]", "")
+		result.append(new_sequence)
+	return result
+
+func parse_play_action(action: String) -> Dictionary:
+	"""
+	Parse play action like 'bobbyplayidle'
+	Returns dict with node_name and animation_name
+	Pattern: <nodename>play<animationname>
+	"""
+	var regex = RegEx.new()
+	regex.compile(r"^([a-zA-Z0-9]+)play([a-zA-Z0-9]+)$")
+	
+	var match = regex.search(action)
+	if match:
+		return {
+			"node_name": match.get_string(1),
+			"animation_name": match.get_string(2)
+		}
+	
+	return {}
+
+func parse_rename_action(action: String) -> Dictionary:
+	"""
+	Parse rename action like 'renameprofessorleft_professorbackandforth'
+	Returns dict with old_name and new_name
+	Pattern: rename<oldname>_<newname>
+	"""
+	var regex = RegEx.new()
+	regex.compile(r"^rename([a-zA-Z0-9]+)_([a-zA-Z0-9]+)$")
+	
+	var match = regex.search(action)
+	if match:
+		return {
+			"old_name": match.get_string(1),
+			"new_name": match.get_string(2)
+		}
+	
+	return {}
+
+func execute_rename_action(old_name: String, new_name: String) -> void:
+	"""
+	[rename<oldname>_<newname>]:
+	Looks at game.currentlyin (e.g. "worldmap") to find which area node is
+	currently active under 'game', then finds a child of that area node with
+	the exact name old_name, and renames it to new_name. Does nothing if any
+	part of that lookup fails (currentlyin missing, area not found, or the
+	target node not found) - in which case a warning is printed listing the
+	actual children found, to make name mismatches easy to spot.
+	
+	If the renamed node is an NPCController, its type (directional, followplayer,
+	backandforth, walk, etc.) was only ever detected once in _ready(), based on
+	its name at that time. Renaming alone would NOT change its behavior, since
+	nothing re-runs that detection - so after renaming, we explicitly call
+	detect_npc_type() and initialize_npc_type() again so the NPC actually starts
+	behaving like its new name says, not just labeled differently.
+	"""
+	var current_area_name = game.get("currentlyin")
+	if current_area_name == null:
+		push_warning("execute_rename_action: 'game' has no 'currentlyin' variable")
+		return
+	
+	if not game.has_node(current_area_name):
+		var available = get_children_names(game)
+		push_warning("execute_rename_action: 'game' has no child named '%s'. Available children: %s" % [current_area_name, available])
+		return
+	
+	var area_node = game.get_node(current_area_name)
+	if not area_node.has_node(old_name):
+		var available = get_children_names(area_node)
+		push_warning("execute_rename_action: '%s' has no child named '%s'. Available children: %s" % [current_area_name, old_name, available])
+		return
+	
+	var target_node = area_node.get_node(old_name)
+	target_node.name = new_name
+	
+	# Re-run NPC type detection/initialization so behavior matches the new name,
+	# not just the label - detect_npc_type() only ever ran once, in _ready()
+	if target_node.has_method("detect_npc_type"):
+		target_node.detect_npc_type()
+		if target_node.has_method("initialize_npc_type"):
+			target_node.initialize_npc_type()
+
+func get_children_names(node: Node) -> Array:
+	"""Return the names of a node's direct children, used for debug warnings"""
+	var names = []
+	for child in node.get_children():
+		names.append(child.name)
+	return names
+
+func play_node_animation(node_name: String, animation_name: String) -> void:
+	"""
+	Play an animation on a node's child AnimationPlayer
+	Looks for node_name/AnimationPlayer and plays the animation
+	"""
+	if has_node(node_name):
+		var node = get_node(node_name)
+		if node.has_node("AnimationPlayer"):
+			var anim_player = node.get_node("AnimationPlayer")
+			anim_player.play(animation_name)
+		else:
+			push_warning("Node '%s' does not have an AnimationPlayer child" % node_name)
+	else:
+		push_warning("Node '%s' not found" % node_name)
+
+func scroll_text(text: String):
+	is_scrolling = true
+	can_continue = false
+	dialoguetext.text = ""
+	
+	if instant_text_mode:
+		dialoguetext.text = text
+		is_scrolling = false
+		return
+	
+	var displayed_text = ""
+	var char_index = 0
+	
+	while char_index < text.length():
+		# Check if holding cancelkey for faster scroll
+		var current_speed = scroll_fastforward_speed if Input.is_action_pressed("cancelkey") else scroll_speed
+		await get_tree().create_timer(current_speed).timeout
+		
+		displayed_text += text[char_index]
+		dialoguetext.text = displayed_text
+		char_index += 1
+	
+	is_scrolling = false
+
+func next_sequence():
+	current_sequence_index += 1
+	play_current_sequence()
+
+func end_dialogue():
+	dialogueplaying = false
+	root.gamepaused = false
+	dialoguetext.text = ""
+	can_continue = false
+	is_in_choice_mode = false
+	in_choice_response = false
+	hide_all_choice_nodes()
+	parent.visible = false  # Hide dialogues when done
