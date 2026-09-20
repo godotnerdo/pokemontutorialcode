@@ -1,0 +1,765 @@
+extends CharacterBody2D
+class_name NPCController
+
+# Optional overrides - leave empty to use the default relative paths below.
+# Set these in the Inspector for NPCs that live at a different tree depth
+# than the original livingroom setup (e.g. worldmap NPCs).
+@export var player_override: NodePath
+@export var root_override: NodePath
+@export var dialogues_override: NodePath
+@export var camera_override: NodePath
+@export var follow_trail_distance: float = 150.0  # how far behind the target npc this npc trails (for npcfollownpc)
+@export var pause_trigger_delay: float = 2.0  # seconds to wait once conditions are met, for any npc with "pause" in its name
+@export var pause_trigger_distance: float = 60.0  # how close the player must be to start the pause timer
+
+@onready var npchitbox: CollisionShape2D = $CollisionShape2D
+@onready var npcplayer: AnimationPlayer = $AnimationPlayer
+@onready var npctalkbox: Area2D = $npctalkbox
+@onready var player: CharacterBody2D = get_node(player_override) if player_override != NodePath("") else $"../../player"
+@onready var playerplayer: AnimationPlayer = player.get_node("AnimationPlayer")
+@onready var playerhitbox: CollisionShape2D = player.get_node("CollisionShape2D")
+@onready var playertalkbox: Area2D = player.get_node("Area2D")
+@onready var root: Node2D = get_node(root_override) if root_override != NodePath("") else $"../../.."
+@onready var dialogues: CanvasLayer = get_node(dialogues_override) if dialogues_override != NodePath("") else $"../../../dialogues"
+@onready var camera: Camera2D = get_node(camera_override) if camera_override != NodePath("") else player.get_node("Camera2D")
+
+var was_gamepaused = false
+var npc_type: String = ""  # "directional", "followplayer", "follownpc", "backandforth", "walk"
+
+# Pause trigger variables (any npc with "pause" in its name, e.g. mombackandforthpause, momleftpause, momwalkpause)
+var has_pause_trigger: bool = false
+var pause_trigger_timer: float = 0.0
+var pause_dialogue_active: bool = false
+
+# Follow Player variables
+var follow_state: String = "idle"  # "idle", "following", "talking", "returning"
+var follow_original_position: Vector2
+
+# Follow NPC variables (npc following another sibling npc, e.g. pikachufollowprofessor)
+var follow_npc_target_keyword: String = ""
+var follow_npc_target: Node2D = null
+
+# Back and Forth variables
+var ba_start_position: Vector2
+var ba_end_position: Vector2
+var ba_moving_forward: bool = true
+
+# Random Walk variables
+var walk_timer: float = 0.0
+var walk_current_pause_time: float = 0.0
+var walk_moving: bool = true
+var walk_original_position: Vector2
+var walk_max_distance: float = 100.0
+var walk_distance_traveled: float = 0.0
+var walk_direction: Vector2 = Vector2.ZERO
+
+# Movement variables
+var current_direction: String = ""
+var move_speed: float = 500.0
+var is_moving: bool = false
+
+func _ready():
+	was_gamepaused = root.gamepaused
+	detect_npc_type()
+	initialize_npc_type()
+
+func _process(delta):
+	# Only process if parent node is visible
+	if not get_parent().visible:
+		return
+	
+	# Check if gamepaused just became false and resume NPC animation based on name
+	if was_gamepaused and not root.gamepaused:
+		on_gamepaused_false()
+	was_gamepaused = root.gamepaused
+	
+	# Handle "pause" name trigger - independent of npc_type, works for any npc
+	# with "pause" in its name (mombackandforthpause, momleftpause, momwalkpause, etc).
+	# Same "in camera" condition as npcfollowplayer uses to start following,
+	# except instead of triggering instantly, it waits pause_trigger_delay seconds.
+	if has_pause_trigger:
+		if not pause_dialogue_active:
+			if is_npc_in_camera():
+				pause_trigger_timer += delta
+				if pause_trigger_timer >= pause_trigger_delay:
+					trigger_pause_dialogue()
+			else:
+				pause_trigger_timer = 0.0
+		
+		# While the pause dialogue is pending trigger or currently active, freeze
+		# all other behavior for this npc (no movement, no selectkey dialogue)
+		if pause_dialogue_active:
+			return
+	
+	# Check if game is not paused and selectkey is pressed (for directional NPCs)
+	if not root.gamepaused and npc_type == "directional":
+		if Input.is_action_just_pressed("selectkey"):
+			var overlapping = playertalkbox.get_overlapping_bodies()
+			if self in overlapping:
+				initiate_dialogue()
+	
+	# Handle specific NPC type behaviors
+	match npc_type:
+		"followplayer":
+			update_follow_player(delta)
+		"follownpc":
+			update_follow_npc(delta)
+		"backandforth":
+			update_back_and_forth(delta)
+		"walk":
+			update_random_walk(delta)
+
+func trigger_pause_dialogue():
+	pause_dialogue_active = true
+	velocity = Vector2.ZERO
+	
+	# Face towards wherever the player currently is, relative to this npc's
+	# own position - same detection used by npcfollowplayer. If the player is
+	# to the left, npc faces left; if above, npc faces up; etc. Frozen at frame 0.001
+	var face_direction = get_direction_from_npc_to_player()
+	if face_direction != "":
+		play_safe(face_direction)
+		seek_safe(0.001)
+		pause_safe()
+	else:
+		pause_safe()
+	
+	root.gamepaused = true
+	dialogues.visible = true
+	
+	var dialogue_node = find_dialogue_node()
+	if dialogue_node:
+		dialogue_node.start_dialogue()
+	else:
+		push_error("PAUSE TRIGGER DIALOGUE: No dialogue node found matching NPC name '" + self.name + "'. Children of 'dialogues' are: " + str(get_children_names(dialogues)))
+
+func detect_npc_type():
+	var name_lower = self.name.to_lower()
+	
+	if "followplayer" in name_lower:
+		npc_type = "followplayer"
+	elif "follow" in name_lower:
+		npc_type = "follownpc"
+	elif "backandforth" in name_lower:
+		npc_type = "backandforth"
+	elif "walk" in name_lower:
+		npc_type = "walk"
+	elif "up" in name_lower or "down" in name_lower or "left" in name_lower or "right" in name_lower:
+		npc_type = "directional"
+	else:
+		npc_type = "directional"  # Default
+	
+	# "pause" can be appended to any of the above types, e.g. mombackandforthpause,
+	# momleftpause, momwalkpause - independent of which base type it is
+	has_pause_trigger = "pause" in name_lower
+
+func initialize_npc_type():
+	match npc_type:
+		"directional":
+			initialize_directional()
+		"followplayer":
+			initialize_follow_player()
+		"follownpc":
+			initialize_follow_npc()
+		"backandforth":
+			initialize_back_and_forth()
+		"walk":
+			initialize_random_walk()
+
+# ==================== DIRECTIONAL NPC ====================
+func initialize_directional():
+	var direction = extract_direction_from_name()
+	if direction:
+		play_safe(direction)
+		seek_safe(0.001)
+		pause_safe()
+
+func extract_direction_from_name() -> String:
+	var name_lower = self.name.to_lower()
+	if "up" in name_lower:
+		return "up"
+	elif "down" in name_lower:
+		return "down"
+	elif "left" in name_lower:
+		return "left"
+	elif "right" in name_lower:
+		return "right"
+	return ""
+
+func get_opposite_direction(direction: String) -> String:
+	match direction:
+		"up":
+			return "down"
+		"down":
+			return "up"
+		"left":
+			return "right"
+		"right":
+			return "left"
+	return ""
+
+func play_safe(anim: String):
+	"""Safely play animation - does nothing if AnimationPlayer doesn't exist"""
+	if npcplayer:
+		npcplayer.play(anim)
+
+func seek_safe(position: float):
+	"""Safely seek animation - does nothing if AnimationPlayer doesn't exist"""
+	if npcplayer:
+		npcplayer.seek(position)
+
+func pause_safe():
+	"""Safely pause animation - does nothing if AnimationPlayer doesn't exist"""
+	if npcplayer:
+		npcplayer.pause()
+
+func initiate_dialogue():
+	# For followplayer NPCs, use position-based direction
+	# For other NPCs, use player.last_direction
+	var player_direction: String
+	var npc_direction: String
+	
+	if npc_type == "followplayer":
+		player_direction = get_direction_from_player_to_npc()
+		npc_direction = get_direction_from_npc_to_player()
+	else:
+		player_direction = player.last_direction
+		npc_direction = get_opposite_direction(player_direction)
+	
+	if npc_direction == "":
+		return
+	
+	play_safe(npc_direction)
+	seek_safe(0.001)
+	pause_safe()
+	
+	playerplayer.play(player_direction)
+	playerplayer.seek(0.001)
+	playerplayer.pause()
+	
+	root.gamepaused = true
+	dialogues.visible = true
+	
+	var dialogue_node = find_dialogue_node()
+	if dialogue_node:
+		dialogue_node.start_dialogue()
+	else:
+		push_error("Dialogue node with name '" + self.name + "' not found in dialogues! Children are: " + str(get_children_names(dialogues)))
+
+func on_gamepaused_false():
+	# Reset pause-trigger state so movement resumes and it won't instantly re-fire
+	if has_pause_trigger and pause_dialogue_active:
+		pause_dialogue_active = false
+		pause_trigger_timer = 0.0
+		has_pause_trigger = false  # this only ever triggers once
+		
+		# Rename: strip "pause" out of the name, case-insensitively, keeping
+		# everything else intact - e.g. "professorbackandforthpause" -> "professorbackandforth"
+		var lower_name = self.name.to_lower()
+		var p_idx = lower_name.find("pause")
+		if p_idx != -1:
+			var new_name = self.name.substr(0, p_idx) + self.name.substr(p_idx + "pause".length())
+			self.name = new_name
+	
+	match npc_type:
+		"directional":
+			var direction = extract_direction_from_name()
+			if direction:
+				play_safe(direction)
+				seek_safe(0.001)
+				pause_safe()
+		"followplayer":
+			if follow_state == "talking":
+				follow_state = "returning"
+				root.gamepaused = true
+		"backandforth":
+			play_safe(current_direction)
+		"walk":
+			if walk_moving:
+				play_safe(current_direction)
+			else:
+				seek_safe(0.001)
+				pause_safe()
+
+# ==================== FOLLOW PLAYER NPC ====================
+func initialize_follow_player():
+	follow_state = "idle"
+	follow_original_position = global_position
+	seek_safe(0.001)
+	pause_safe()
+
+func update_follow_player(delta):
+	# Once talking, do absolutely nothing else until dialogue resets this externally
+	if follow_state == "talking":
+		return
+	
+	if follow_state == "returning":
+		var direction = calculate_pathfind_direction(global_position, follow_original_position)
+		
+		if direction != Vector2.ZERO:
+			velocity = direction * move_speed
+			move_and_slide()
+			current_direction = vector_to_direction_name(direction)
+			play_direction_animation(current_direction)
+		else:
+			velocity = Vector2.ZERO
+			finish_returning_home()
+		return
+	
+	var in_camera = is_npc_in_camera()
+	
+	if follow_state == "idle":
+		if in_camera:
+			follow_state = "following"
+			root.gamepaused = true
+		else:
+			seek_safe(0.001)
+			pause_safe()
+			return
+	
+	if follow_state == "following":
+		if not in_camera:
+			follow_state = "idle"
+			seek_safe(0.001)
+			pause_safe()
+			return
+		
+		# Move towards player - only in cardinal directions
+		var direction = calculate_pathfind_direction(global_position, player.global_position)
+		
+		if direction != Vector2.ZERO:
+			velocity = direction * move_speed
+			move_and_slide()
+			current_direction = vector_to_direction_name(direction)
+			play_direction_animation(current_direction)
+		else:
+			velocity = Vector2.ZERO
+		
+		# Check if we physically collided with the player (this is the real "reached" signal,
+		# since move_and_slide() will stop the NPC at the player's collision shape before
+		# any raw distance threshold could ever be satisfied)
+		var hit_player = false
+		for i in get_slide_collision_count():
+			var collision = get_slide_collision(i)
+			if collision.get_collider() == player:
+				hit_player = true
+				break
+		
+		# Also fall back to a generous distance check in case collision shapes don't touch exactly
+		var distance_to_player = global_position.distance_to(player.global_position)
+		
+		if hit_player or distance_to_player < 40:
+			follow_state = "talking"
+			
+			# Play animations facing each other
+			play_safe(get_direction_from_npc_to_player())
+			seek_safe(0.001)
+			pause_safe()
+			
+			playerplayer.play(get_direction_from_player_to_npc())
+			playerplayer.seek(0.001)
+			playerplayer.pause()
+			
+			root.gamepaused = true
+			dialogues.visible = true
+			
+			var dialogue_node = find_dialogue_node()
+			if dialogue_node:
+				dialogue_node.start_dialogue()
+			else:
+				push_error("FOLLOWPLAYER DIALOGUE: No dialogue node found matching NPC name '" + self.name + "'. Children of 'dialogues' are: " + str(get_children_names(dialogues)))
+			return
+
+func finish_returning_home():
+	# Stop at the last direction faced, paused at frame 0.001
+	var final_direction = current_direction
+	if final_direction == "":
+		final_direction = "down"  # safe fallback
+	
+	play_safe(final_direction)
+	seek_safe(0.001)
+	pause_safe()
+	
+	# Rename NPC: replace "followplayer" in its name with the final direction
+	# e.g. "momfollowplayer" -> "momleft"
+	var lower_name = self.name.to_lower()
+	var idx = lower_name.find("followplayer")
+	if idx != -1:
+		var new_name = self.name.substr(0, idx) + final_direction + self.name.substr(idx + "followplayer".length())
+		self.name = new_name
+	
+	# Convert to a permanent directional NPC - it will never follow again
+	npc_type = "directional"
+	follow_state = "idle"
+	
+	root.gamepaused = false
+
+# ==================== FOLLOW NPC (sibling) ====================
+func initialize_follow_npc():
+	# Disable this NPC's physical collision entirely so it never blocks or
+	# gets blocked by the NPC it's following, the player, or other bodies.
+	# We do both: disable the collision shape AND zero out the collision
+	# layer/mask on the body itself, deferred so it reliably takes effect
+	# after the physics server has registered the node.
+	call_deferred("_disable_follow_npc_collision")
+	
+	# Parse the target keyword from the name: everything after "follow"
+	# e.g. "pikachufollowprofessor" -> "professor"
+	var name_lower = self.name.to_lower()
+	var idx = name_lower.find("follow")
+	if idx != -1:
+		follow_npc_target_keyword = name_lower.substr(idx + "follow".length())
+	
+	follow_npc_target = null  # resolved lazily once siblings are ready
+
+func _disable_follow_npc_collision():
+	collision_layer = 0
+	collision_mask = 0
+	if npchitbox:
+		npchitbox.disabled = true
+		npchitbox.set_deferred("disabled", true)
+
+func find_follow_npc_target() -> Node2D:
+	if follow_npc_target_keyword == "":
+		return null
+	var parent_node = get_parent()
+	if not parent_node:
+		return null
+	for child in parent_node.get_children():
+		if child == self:
+			continue
+		if child is Node2D and follow_npc_target_keyword in child.name.to_lower():
+			return child
+	return null
+
+func update_follow_npc(delta):
+	# Defensively re-enforce collision disabling every frame - if anything
+	# (scene reload, property re-application, timing race) ever re-enables
+	# this NPC's collision, it will cause a runaway push-feedback loop against
+	# whatever it's overlapping, since this NPC snaps directly onto its
+	# target's position every frame.
+	collision_layer = 0
+	collision_mask = 0
+	if npchitbox and not npchitbox.disabled:
+		npchitbox.disabled = true
+	
+	# Resolve target lazily (siblings may not have been ready at _ready() time)
+	if follow_npc_target == null:
+		follow_npc_target = find_follow_npc_target()
+		if follow_npc_target == null:
+			velocity = Vector2.ZERO
+			return
+	
+	# Move towards a point trailing behind the target npc - only in cardinal
+	# directions, never diagonal. We don't target the exact same coordinates
+	# as the target, since that would cause them to overlap; instead we aim
+	# for a fixed distance behind whichever way the target is currently facing,
+	# so this npc follows a step or two behind rather than sitting on top of it.
+	var trail_offset = Vector2.ZERO
+	if "current_direction" in follow_npc_target:
+		trail_offset = direction_to_vector(follow_npc_target.current_direction) * follow_trail_distance
+	
+	var target_point = follow_npc_target.global_position - trail_offset
+	
+	var direction = calculate_pathfind_direction(global_position, target_point)
+	
+	if direction != Vector2.ZERO:
+		velocity = direction * move_speed
+		global_position += direction * move_speed * delta
+		current_direction = vector_to_direction_name(direction)
+		play_direction_animation(current_direction)
+	else:
+		velocity = Vector2.ZERO
+
+func is_npc_in_camera() -> bool:
+	if not camera:
+		return false
+	var camera_rect = camera.get_screen_center_position()
+	var viewport_size = get_viewport_rect().size / camera.zoom
+	var camera_bounds = Rect2(camera_rect - viewport_size / 2, viewport_size)
+	return camera_bounds.has_point(global_position)
+
+func start_follow_dialogue():
+	playerplayer.play(get_direction_from_player_to_npc())
+	playerplayer.seek(0.001)
+	playerplayer.pause()
+	
+	play_safe(get_direction_from_npc_to_player())
+	seek_safe(0.001)
+	pause_safe()
+	
+	dialogues.visible = true
+	
+	var dialogue_node = dialogues.get_node_or_null(NodePath(self.name))
+	if dialogue_node:
+		dialogue_node.start_dialogue()
+	else:
+		push_error("Dialogue node with name '" + self.name + "' not found in dialogues!")
+
+func get_direction_from_player_to_npc() -> String:
+	var diff = global_position - player.global_position
+	if abs(diff.x) > abs(diff.y):
+		return "right" if diff.x > 0 else "left"
+	else:
+		return "down" if diff.y > 0 else "up"
+
+func get_direction_from_npc_to_player() -> String:
+	return get_opposite_direction(get_direction_from_player_to_npc())
+
+# ==================== BACK AND FORTH NPC ====================
+func initialize_back_and_forth():
+	ba_start_position = global_position
+	# Default end position - can be adjusted based on name parsing if needed
+	ba_end_position = ba_start_position + Vector2(550, 0)  # Default 550 pixels to the right
+	ba_moving_forward = true
+
+func update_back_and_forth(delta):
+	var target = ba_end_position if ba_moving_forward else ba_start_position
+	var direction = calculate_pathfind_direction(global_position, target)
+	
+	if direction != Vector2.ZERO:
+		velocity = direction * move_speed
+		move_and_slide()
+		
+		var dir_name = vector_to_direction_name(direction)
+		if dir_name != current_direction:
+			current_direction = dir_name
+			play_direction_animation(current_direction)
+	else:
+		# Either reached the target, or completely blocked by a wall - either way, turn around
+		velocity = Vector2.ZERO
+		ba_moving_forward = not ba_moving_forward
+
+# ==================== RANDOM WALK NPC ====================
+func initialize_random_walk():
+	walk_original_position = global_position
+	walk_timer = 0.0
+	walk_moving = true
+	walk_distance_traveled = 0.0
+	walk_direction = Vector2.ZERO
+	start_random_walk_segment()
+
+func start_random_walk_segment():
+	# Choose a random direction that doesn't have a wall in front
+	walk_direction = get_valid_random_direction()
+	
+	if walk_direction == Vector2.ZERO:
+		# All directions blocked, wait and try again
+		walk_moving = false
+		walk_current_pause_time = 1.0
+		return
+	
+	walk_distance_traveled = 0.0
+	walk_moving = true
+
+func update_random_walk(delta):
+	if walk_moving:
+		# Check if we've traveled the max distance
+		if walk_distance_traveled >= walk_max_distance:
+			walk_moving = false
+			walk_current_pause_time = randf_range(1.0, 3.0)
+			seek_safe(0.001)
+			pause_safe()
+			return
+		
+		# Try to move in the committed direction
+		if walk_direction != Vector2.ZERO:
+			var test_pos = global_position + (walk_direction * move_speed * delta)
+			
+			# Check if path ahead is clear
+			if not is_wall_at(test_pos):
+				velocity = walk_direction * move_speed
+				move_and_slide()
+				walk_distance_traveled += move_speed * delta
+				
+				# Update animation
+				var dir_name = vector_to_direction_name(walk_direction)
+				if dir_name != current_direction:
+					current_direction = dir_name
+					play_direction_animation(current_direction)
+			else:
+				# Hit a wall, stop moving
+				walk_moving = false
+				walk_current_pause_time = randf_range(1.0, 3.0)
+				seek_safe(0.001)
+				pause_safe()
+				return
+		else:
+			velocity = Vector2.ZERO
+	else:
+		# Paused, waiting
+		walk_current_pause_time -= delta
+		if walk_current_pause_time <= 0:
+			start_random_walk_segment()
+
+func random_direction() -> Vector2:
+	var directions = [Vector2.UP, Vector2.DOWN, Vector2.LEFT, Vector2.RIGHT]
+	return directions[randi() % directions.size()]
+
+func get_valid_random_direction() -> Vector2:
+	# Try to find a direction without a wall in front
+	var directions = [Vector2.UP, Vector2.DOWN, Vector2.LEFT, Vector2.RIGHT]
+	directions.shuffle()
+	
+	for dir in directions:
+		var test_pos = global_position + (dir * 20)
+		if not is_wall_at(test_pos):
+			return dir
+	
+	# If all directions have walls, return zero
+	return Vector2.ZERO
+
+# ==================== PATHFINDING ====================
+func calculate_pathfind_direction(from: Vector2, to: Vector2) -> Vector2:
+	var diff = to - from
+	
+	# First priority: Match X coordinate (horizontal alignment)
+	# Keep moving left/right until X is roughly aligned, then move to Y
+	if abs(diff.x) > 3:
+		# Still need to align X coordinate
+		var test_pos = from + Vector2(sign(diff.x) * 5, 0)
+		if not is_wall_at(test_pos):
+			return Vector2(sign(diff.x), 0)
+		# If blocked by obstacle, try to dodge with vertical movement
+		var test_pos_v = from + Vector2(0, sign(diff.y) * 5)
+		if not is_wall_at(test_pos_v):
+			return Vector2(0, sign(diff.y))
+		return Vector2.ZERO
+	
+	# Second priority: Match Y coordinate (vertical alignment)
+	# X is now aligned, move up/down until Y is aligned
+	if abs(diff.y) > 3:
+		var test_pos = from + Vector2(0, sign(diff.y) * 5)
+		if not is_wall_at(test_pos):
+			return Vector2(0, sign(diff.y))
+		# If blocked by obstacle, try to dodge with horizontal movement
+		var test_pos_h = from + Vector2(sign(diff.x) * 5, 0)
+		if not is_wall_at(test_pos_h):
+			return Vector2(sign(diff.x), 0)
+		return Vector2.ZERO
+	
+	# Both X and Y are aligned, reached target
+	return Vector2.ZERO
+
+func calculate_pathfind_waypoints(from: Vector2, to: Vector2) -> Array[Vector2]:
+	var waypoints: Array[Vector2] = []
+	var current = from
+	var step_size = 5.0
+	var max_iterations = 10000
+	var iterations = 0
+	
+	while current.distance_to(to) > step_size and iterations < max_iterations:
+		var diff = to - current
+		var next_pos = current
+		var moved = false
+		
+		# First priority: Move horizontally until X is aligned
+		if abs(diff.x) > 1:
+			next_pos = current + Vector2(sign(diff.x) * step_size, 0)
+			if not is_wall_at(next_pos):
+				current = next_pos
+				waypoints.append(current)
+				moved = true
+			else:
+				# Blocked horizontally, try vertical to dodge
+				next_pos = current + Vector2(0, sign(diff.y) * step_size)
+				if not is_wall_at(next_pos):
+					current = next_pos
+					waypoints.append(current)
+					moved = true
+		# Second priority: Move vertically until Y is aligned
+		elif abs(diff.y) > 1:
+			next_pos = current + Vector2(0, sign(diff.y) * step_size)
+			if not is_wall_at(next_pos):
+				current = next_pos
+				waypoints.append(current)
+				moved = true
+			else:
+				# Blocked vertically, try horizontal to dodge
+				next_pos = current + Vector2(sign(diff.x) * step_size, 0)
+				if not is_wall_at(next_pos):
+					current = next_pos
+					waypoints.append(current)
+					moved = true
+		
+		if not moved:
+			# Completely blocked, stop pathfinding
+			break
+		
+		iterations += 1
+	
+	waypoints.append(to)
+	return waypoints
+
+func is_wall_at(position: Vector2) -> bool:
+	var space_state = get_world_2d().direct_space_state
+	var query = PhysicsShapeQueryParameters2D.new()
+	var shape = CircleShape2D.new()
+	shape.radius = 15
+	query.shape = shape
+	query.transform.origin = position
+	query.collision_mask = 1  # Adjust based on your collision layers
+	
+	var result = space_state.intersect_shape(query)
+	
+	# Check if any result is a StaticBody2D or wall
+	for res in result:
+		var collider = res.collider
+		if collider is StaticBody2D or collider.name.to_lower().contains("wall"):
+			return true
+	
+	return false
+
+# ==================== UTILITY ====================
+func find_dialogue_node() -> Node:
+	# Case-insensitive search for a child of 'dialogues' matching self.name
+	var target_name = self.name.to_lower()
+	
+	# First try exact match
+	for child in dialogues.get_children():
+		if child.name.to_lower() == target_name:
+			return child
+	
+	# Fallback: replace the direction suffix (left/right/up/down) with "idle"
+	# e.g. "momleft" -> "momidle"
+	var fallback_name = get_idle_fallback_name(target_name)
+	if fallback_name != "":
+		for child in dialogues.get_children():
+			if child.name.to_lower() == fallback_name:
+				return child
+	
+	return null
+
+func get_idle_fallback_name(name_lower: String) -> String:
+	for dir in ["left", "right", "up", "down"]:
+		if name_lower.ends_with(dir):
+			return name_lower.substr(0, name_lower.length() - dir.length()) + "idle"
+	return ""
+
+func get_children_names(node: Node) -> Array:
+	var names = []
+	for child in node.get_children():
+		names.append(child.name)
+	return names
+
+func vector_to_direction_name(vec: Vector2) -> String:
+	if abs(vec.x) > abs(vec.y):
+		return "right" if vec.x > 0 else "left"
+	else:
+		return "down" if vec.y > 0 else "up"
+
+func direction_to_vector(dir: String) -> Vector2:
+	match dir:
+		"up":
+			return Vector2(0, -1)
+		"down":
+			return Vector2(0, 1)
+		"left":
+			return Vector2(-1, 0)
+		"right":
+			return Vector2(1, 0)
+	return Vector2.ZERO
+
+func play_direction_animation(direction: String):
+	if npcplayer and npcplayer.current_animation != direction:
+		npcplayer.play(direction)
