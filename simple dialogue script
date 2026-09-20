@@ -1,0 +1,129 @@
+extends Node2D
+@onready var textbox: Sprite2D = $Sprite2D
+@onready var dialoguetext: Label = $Label
+@onready var parent: CanvasLayer = $".."
+@onready var root: Node2D = $"../.."
+
+# ========== DIALOGUE SEQUENCES - EDIT HERE ==========
+# Format: ["text to display", "continue" or "end"]
+# "continue" = more dialogue after this
+# "end" = dialogue stops after this
+var dialogue_sequences = [
+	["Hello! You over there! Please help!", "continue"],
+	["In my bag! There's a Pokeball!", "end"]
+]
+# ====================================================
+
+var dialogueplaying = false
+var max_lines_per_page = 2  # Maximum lines to display before waiting for selectkey
+var chars_per_line = 40  # Adjust based on your label width (estimate)
+var scroll_speed = 0.03  # Time per character (lower = faster)
+var scroll_fastforward_speed = 0.01  # Speed when holding cancelkey
+var current_sequence_index = 0
+var sequences = []
+var can_continue = false
+var is_scrolling = false
+
+func _ready():
+	dialoguetext.text = ""
+	visible = false
+	# Make parent immune to visibility toggling from room changes
+	parent.set_meta("rootvisibilityimmune", true)
+	# Enable text wrapping on the label
+	dialoguetext.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+
+func _process(_delta):
+	# Update visibility based on dialogueplaying
+	visible = dialogueplaying
+	
+	# Handle selectkey to continue
+	if dialogueplaying and can_continue and Input.is_action_just_pressed("selectkey"):
+		next_sequence()
+
+func start_dialogue(custom_sequences = null):
+	"""
+	Start dialogue. Leave empty to use dialogue_sequences at top.
+	Or pass custom array: start_dialogue([["text", "continue"], ["more", "end"]])
+	"""
+	var dialogues_to_play = custom_sequences if custom_sequences else dialogue_sequences
+	
+	root.gamepaused = true
+	dialogueplaying = true
+	sequences = split_long_text(dialogues_to_play)
+	current_sequence_index = 0
+	can_continue = false
+	is_scrolling = false
+	dialoguetext.text = ""
+	
+	play_current_sequence()
+
+func split_long_text(dialogue_sequences: Array) -> Array:
+	"""Split text into pages based on max_lines_per_page"""
+	var result = []
+	var max_chars_per_page = max_lines_per_page * chars_per_line
+	
+	for sequence in dialogue_sequences:
+		var text = sequence[0]
+		var action = sequence[1]
+		
+		# If text is longer than limit, split it into pages
+		if text.length() > max_chars_per_page:
+			var remaining = text
+			while remaining.length() > 0:
+				var chunk = remaining.substr(0, max_chars_per_page)
+				remaining = remaining.substr(max_chars_per_page)
+				
+				# All chunks except the last use "continue" for page breaks
+				if remaining.length() > 0:
+					result.append([chunk, "continue"])
+				else:
+					# Last chunk uses the original action
+					result.append([chunk, action])
+		else:
+			result.append(sequence)
+	
+	return result
+
+func play_current_sequence():
+	if current_sequence_index >= sequences.size():
+		end_dialogue()
+		return
+	
+	var sequence = sequences[current_sequence_index]
+	var text = sequence[0]  # The text to display
+	
+	# Start scrolling the text
+	await scroll_text(text)
+	
+	# After scrolling, wait 0.5 seconds before allowing continue
+	await get_tree().create_timer(0.5).timeout
+	can_continue = true
+
+func scroll_text(text: String):
+	is_scrolling = true
+	can_continue = false
+	dialoguetext.text = ""
+	
+	var displayed_text = ""
+	var char_index = 0
+	
+	while char_index < text.length():
+		# Check if holding cancelkey for faster scroll
+		var current_speed = scroll_fastforward_speed if Input.is_action_pressed("cancelkey") else scroll_speed
+		await get_tree().create_timer(current_speed).timeout
+		
+		displayed_text += text[char_index]
+		dialoguetext.text = displayed_text
+		char_index += 1
+	
+	is_scrolling = false
+
+func next_sequence():
+	current_sequence_index += 1
+	play_current_sequence()
+
+func end_dialogue():
+	dialogueplaying = false
+	root.gamepaused = false
+	dialoguetext.text = ""
+	can_continue = false
